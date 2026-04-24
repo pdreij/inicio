@@ -1,0 +1,33 @@
+@import "tailwindcss";
+
+@theme {
+  --color-ink-950: #07131a;
+  --color-ink-900: #0d1f2a;
+  --color-ink-800: #143242;
+  --color-brand-blue: #2ba6ff;
+  --color-brand-green: #26d39d;
+  --color-brand-cyan: #2de2e6;
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    min-height: 100%;
+    background: transparent !important;
+    background-color: transparent !important;
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    box-sizing: border-box;
+  }
+
+  body {
+    font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    color: #edf2ff;
+  }
+
+  #root {
+    padding: 10px;
+  }
+}
