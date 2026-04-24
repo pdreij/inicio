@@ -33,7 +33,7 @@ Desktop app for running and monitoring scripts across multiple local projects.
 ### Clone and run
 
 ```bash
-git clone <your-repo-url>
+git clone https://github.com/pdreij/inicio.git
 cd inicio
 npm install
 npm run tauri dev
