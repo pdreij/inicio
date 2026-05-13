@@ -238,7 +238,9 @@ function portConflictFingerprint(script: Script): string {
   if (h === undefined) {
     return "";
   }
-  return `${h.ports.join(",")}|${h.listeners.map((l) => `${l.pid}:${l.command}`).join(";")}|${h.inferredPort ?? "null"}`;
+  return `${h.ports.join(",")}|${h.listeners
+    .map((l) => `${l.pid}:${l.command}:${l.cwd ?? ""}`)
+    .join(";")}|${h.inferredPort ?? "null"}`;
 }
 
 export const ScriptRow = memo(
