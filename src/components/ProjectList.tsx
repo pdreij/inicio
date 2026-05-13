@@ -1,4 +1,5 @@
 import type { Project } from "../types";
+import { getProjectSidebarHealth } from "../lib/projectSidebarHealth";
 import appLogo from "../../src-tauri/icons/icon.png";
 
 type ProjectListProps = {
@@ -69,6 +70,34 @@ export function ProjectList({
           <div className="space-y-2">
             {projects.map((project) => {
               const isActive = project.id === activeProjectId;
+              const health = getProjectSidebarHealth(project);
+              const healthUi = (() => {
+                switch (health) {
+                  case "running":
+                    return {
+                      label: "Running",
+                      className:
+                        "border-brand-green/45 bg-brand-green/18 text-brand-green",
+                    };
+                  case "warning":
+                    return {
+                      label: "Warning",
+                      className:
+                        "border-amber-300/50 bg-amber-400/16 text-amber-100",
+                    };
+                  case "stopped":
+                    return {
+                      label: "Stopped",
+                      className:
+                        "border-slate-400/35 bg-white/10 text-slate-200/95",
+                    };
+                  default: {
+                    const exhaustiveCheck: never = health;
+                    return exhaustiveCheck;
+                  }
+                }
+              })();
+
               return (
                 <div
                   className={`group rounded-xl border p-3  ${
@@ -88,9 +117,17 @@ export function ProjectList({
                   tabIndex={0}
                 >
                   <div className="block w-full text-left">
-                    <span className="block truncate text-sm font-semibold text-white">
-                      {project.name}
-                    </span>
+                    <div className="flex items-center gap-2">
+                      <span className="block min-w-0 flex-1 truncate text-sm font-semibold text-white">
+                        {project.name}
+                      </span>
+                      <span
+                        aria-label={`Project status: ${healthUi.label}`}
+                        className={`shrink-0 rounded-full border px-2 py-0.5 text-[10px] font-bold uppercase tracking-wide ${healthUi.className}`}
+                      >
+                        {healthUi.label}
+                      </span>
+                    </div>
                     <span className="mt-0.5 block truncate text-xs text-slate-200/85">
                       {project.path}
                     </span>

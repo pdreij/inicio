@@ -1,10 +1,14 @@
 import { invoke } from "@tauri-apps/api/core";
+import type { TcpPortListener } from "../types";
 
 export type SavedProject = {
   id: string;
   name: string;
   path: string;
+  pinnedScripts?: string[];
 };
+
+export type { TcpPortListener };
 
 export type SavedProjectsFile = {
   projects: SavedProject[];
@@ -120,4 +124,21 @@ export async function getProcessResources(
   pids: number[],
 ): Promise<ProcessResourceSnapshot[]> {
   return invoke("get_process_resources", { pids });
+}
+
+export async function inspectTcpPortListeners(
+  port: number,
+): Promise<TcpPortListener[]> {
+  return invoke("inspect_tcp_port_listeners", { port });
+}
+
+/** Likely TCP port inferred from script command in package.json (Next.js / --port patterns). */
+export async function inferScriptPortForScript(
+  path: string,
+  script: string,
+): Promise<number | null> {
+  return invoke("infer_script_port_for_script", {
+    path,
+    scriptName: script,
+  });
 }

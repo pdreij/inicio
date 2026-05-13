@@ -9,6 +9,8 @@ type ProjectViewProps = {
   isUpdatingDependencies: boolean;
   updateProgress: number;
   selectedOutdatedPackages: string[];
+  managedScriptPids: ReadonlySet<number>;
+  managedScriptPidSignature: string;
   onRefreshOutdated: () => void;
   onToggleOutdatedPackage: (packageName: string) => void;
   onUpdateDependencies: (includeMajor: boolean) => void;
@@ -16,6 +18,8 @@ type ProjectViewProps = {
   onRunScript: (scriptName: string) => void;
   onStopScript: (scriptName: string) => void;
   onToggleLogs: (scriptName: string) => void;
+  onTogglePinnedScript: (scriptName: string) => void;
+  onDismissPortConflict: (scriptName: string) => void;
   onAddProject: () => void;
 };
 
@@ -27,6 +31,8 @@ export function ProjectView({
   isUpdatingDependencies,
   updateProgress,
   selectedOutdatedPackages,
+  managedScriptPids,
+  managedScriptPidSignature,
   onRefreshOutdated,
   onToggleOutdatedPackage,
   onUpdateDependencies,
@@ -34,6 +40,8 @@ export function ProjectView({
   onRunScript,
   onStopScript,
   onToggleLogs,
+  onTogglePinnedScript,
+  onDismissPortConflict,
   onAddProject,
 }: ProjectViewProps) {
   const packageManagerLabel = outdatedData?.packageManager ?? "unknown";
@@ -164,9 +172,14 @@ export function ProjectView({
           {project.scripts.map((script) => (
             <ScriptRow
               key={script.name}
+              managedScriptPidSignature={managedScriptPidSignature}
+              managedScriptPids={managedScriptPids}
+              isPinned={project.pinnedScripts.includes(script.name)}
+              onDismissPortConflict={() => onDismissPortConflict(script.name)}
               onRun={() => onRunScript(script.name)}
               onStop={() => onStopScript(script.name)}
               onToggleLogs={() => onToggleLogs(script.name)}
+              onTogglePin={() => onTogglePinnedScript(script.name)}
               script={script}
             />
           ))}

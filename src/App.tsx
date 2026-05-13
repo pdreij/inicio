@@ -7,6 +7,8 @@ import {
   checkOutdatedPackages,
   discoverProjectCandidates,
   getProcessResources,
+  inferScriptPortForScript,
+  inspectTcpPortListeners,
   loadProjects,
   openFolderPicker,
   readPackageJson,
@@ -16,6 +18,12 @@ import {
   updateDependencies,
   type SavedProjectsFile,
 } from "./lib/tauri";
+import { orderScriptsWithPins } from "./lib/orderScriptsWithPins";
+import {
+  isLikelyPortBindError,
+  parsePortsFromStderrLine,
+} from "./lib/parsePortConflict";
+import { classifyProcessExit } from "./lib/exitClassification";
 import type {
   AdoptedScript,
   ProcessResourceSnapshot,
@@ -29,6 +37,7 @@ import type {
   OutdatedPackagesData,
   Project,
   Script,
+  TcpPortListener,
 } from "./types";
 
 function isTauriRuntime(): boolean {
@@ -67,13 +76,6 @@ function isAlreadyRunningMessage(stream: string, line: string): boolean {
   );
 }
 
-function hasProcessFailed(payload: ProcessExitPayload): boolean {
-  if (payload.signal !== null) {
-    return true;
-  }
-  return payload.code !== null && payload.code !== 0;
-}
-
 function updateScriptInProjects(
   projects: Project[],
   projectId: string,
@@ -103,9 +105,23 @@ function buildPersistPayload(
       id: project.id,
       name: project.name,
       path: project.path,
+      ...(project.pinnedScripts.length > 0
+        ? { pinnedScripts: project.pinnedScripts }
+        : {}),
     })),
     activeProjectId: activeProjectId ?? null,
   };
+}
+
+/** Same process identity as port-conflict hydration / `script-log` payload.pid. */
+function scriptMatchesPortHydrateEmitterPid(
+  script: Script,
+  emitterPid: number,
+): boolean {
+  return (
+    script.pid === emitterPid ||
+    (script.externalRunning === true && script.pid === undefined)
+  );
 }
 
 function applyAdoptedScripts(
@@ -131,6 +147,8 @@ function applyAdoptedScripts(
         status: "running",
         pid: adopted.pid,
         externalRunning: true,
+        lastRunSucceeded: undefined,
+        portConflictHint: undefined,
         logs: [
           ...script.logs,
           `[system] adopted already running process (pid ${adopted.pid})`,
@@ -163,6 +181,9 @@ function App() {
   const [isHydrated, setIsHydrated] = useState(!isTauriRuntime());
   const persistSignatureRef = useRef<string>("");
   const hasInitializedOutdatedRef = useRef(false);
+  const latestProjectsRef = useRef<Project[]>(state.projects);
+  latestProjectsRef.current = state.projects;
+  const portHydrateInflightRef = useRef(new Set<string>());
 
   const activeProject = useMemo(() => {
     if (state.activeProjectId === undefined) {
@@ -189,6 +210,21 @@ function App() {
     [runningPids],
   );
 
+  const { managedScriptPids, managedScriptPidSignature } = useMemo(() => {
+    const ids = state.projects.flatMap((project) =>
+      project.scripts
+        .map((script) => script.pid)
+        .filter((pid): pid is number => pid !== undefined),
+    );
+    return {
+      managedScriptPids: new Set(ids),
+      managedScriptPidSignature: ids
+        .slice()
+        .sort((a, b) => a - b)
+        .join(","),
+    };
+  }, [state.projects]);
+
   useEffect(() => {
     if (!isTauriRuntime()) {
       persistSignatureRef.current = JSON.stringify(
@@ -209,15 +245,25 @@ function App() {
 
         const rebuilt: Project[] = [];
         for (const saved of file.projects) {
+          const pinnedScripts = saved.pinnedScripts ?? [];
           try {
             const packageJson = await readPackageJson(saved.path);
-            const scripts = Object.entries(packageJson.scripts).map(
-              ([name, command]) => createScript(name, command),
+            const entries = Object.entries(packageJson.scripts);
+            const canonicalScriptOrder = entries.map(([name]) => name);
+            const scriptsOrdered = entries.map(([name, command]) =>
+              createScript(name, command),
+            );
+            const scripts = orderScriptsWithPins(
+              scriptsOrdered,
+              pinnedScripts,
+              canonicalScriptOrder,
             );
             rebuilt.push({
               id: saved.id,
               name: saved.name,
               path: saved.path,
+              canonicalScriptOrder,
+              pinnedScripts,
               scripts,
             });
           } catch (error) {
@@ -225,6 +271,8 @@ function App() {
               id: saved.id,
               name: saved.name,
               path: saved.path,
+              canonicalScriptOrder: [],
+              pinnedScripts,
               scripts: [],
               importError:
                 error instanceof Error ? error.message : String(error),
@@ -293,6 +341,101 @@ function App() {
     const unsubscribers: Array<() => void> = [];
 
     void (async () => {
+      const hydratePortConflictAfterLogLine = async (
+        projectPath: string,
+        scriptName: string,
+        stderrLine: string,
+        emitterPid: number,
+      ) => {
+        if (cancelled) {
+          return;
+        }
+        const parsedPorts = parsePortsFromStderrLine(stderrLine);
+        let inferredPort: number | null = null;
+        try {
+          inferredPort = await inferScriptPortForScript(
+            projectPath,
+            scriptName,
+          );
+        } catch {
+          inferredPort = null;
+        }
+
+        const portSet = new Set<number>(parsedPorts);
+        if (inferredPort !== null) {
+          portSet.add(inferredPort);
+        }
+        const ports = [...portSet];
+        if (ports.length === 0 || cancelled) {
+          return;
+        }
+
+        const listenerByPid = new Map<number, TcpPortListener>();
+        for (const port of ports) {
+          if (cancelled) {
+            return;
+          }
+          try {
+            const batch = await inspectTcpPortListeners(port);
+            for (const listener of batch) {
+              if (!listenerByPid.has(listener.pid)) {
+                listenerByPid.set(listener.pid, listener);
+              }
+            }
+          } catch {
+            /* best-effort */
+          }
+        }
+
+        if (cancelled) {
+          return;
+        }
+
+        const hint = {
+          ports,
+          listeners: [...listenerByPid.values()],
+          inferredPort,
+        };
+
+        setState((currentState) => {
+          let applied = false;
+          const projects = currentState.projects.map((project) => {
+            if (project.path !== projectPath) {
+              return project;
+            }
+
+            return {
+              ...project,
+              scripts: project.scripts.map((script) => {
+                if (script.name !== scriptName) {
+                  return script;
+                }
+
+                const stillSameRun =
+                  script.status === "running" &&
+                  scriptMatchesPortHydrateEmitterPid(script, emitterPid);
+
+                if (!stillSameRun) {
+                  return script;
+                }
+
+                applied = true;
+                return {
+                  ...script,
+                  portConflictHint: hint,
+                };
+              }),
+            };
+          });
+
+          if (!applied) {
+            return currentState;
+          }
+
+          return { ...currentState, projects };
+        });
+      };
+
       const unlistenLog = await listen<LogEventPayload>(
         "script-log",
         (event) => {
@@ -328,6 +471,41 @@ function App() {
               }),
             })),
           }));
+
+          if (
+            !cancelled &&
+            isLikelyPortBindError(payload.stream, payload.line)
+          ) {
+            const project = latestProjectsRef.current.find(
+              (p) => p.path === payload.path,
+            );
+            const script = project?.scripts.find(
+              (s) => s.name === payload.script,
+            );
+            if (
+              script === undefined ||
+              script.status !== "running" ||
+              !scriptMatchesPortHydrateEmitterPid(script, payload.pid)
+            ) {
+              return;
+            }
+            if (script.portConflictHint !== undefined) {
+              return;
+            }
+            const dedupeKey = `${payload.path}\0${payload.script}\0${payload.pid}`;
+            if (portHydrateInflightRef.current.has(dedupeKey)) {
+              return;
+            }
+            portHydrateInflightRef.current.add(dedupeKey);
+            void hydratePortConflictAfterLogLine(
+              payload.path,
+              payload.script,
+              payload.line,
+              payload.pid,
+            ).finally(() => {
+              portHydrateInflightRef.current.delete(dedupeKey);
+            });
+          }
         },
       );
       if (cancelled) {
@@ -361,6 +539,8 @@ function App() {
                     externalRunning: payload.package_manager === "external",
                     cpuPercent: undefined,
                     memoryMb: undefined,
+                    portConflictHint: undefined,
+                    lastRunSucceeded: undefined,
                     logs: [
                       ...script.logs,
                       `[system] started with ${payload.package_manager} (pid ${payload.pid})`,
@@ -412,17 +592,19 @@ function App() {
                   };
                 }
 
+                const exitClass = classifyProcessExit(payload);
+                const failedExit = exitClass === "failure";
+                const cleanSuccess = exitClass === "success";
+
                 return {
                   ...script,
-                  status: "stopped",
+                  status: failedExit ? "stopped" : "idle",
+                  lastRunSucceeded: cleanSuccess ? true : undefined,
                   pid: undefined,
                   externalRunning: false,
                   cpuPercent: undefined,
                   memoryMb: undefined,
-                  isLogsOpen:
-                    script.isLogsOpen || hasProcessFailed(payload)
-                      ? true
-                      : false,
+                  isLogsOpen: script.isLogsOpen || failedExit ? true : false,
                   logs: [
                     ...script.logs,
                     `[system] process exited (code=${payload.code ?? "none"}, signal=${
@@ -444,6 +626,7 @@ function App() {
 
     return () => {
       cancelled = true;
+      portHydrateInflightRef.current.clear();
       for (const unsubscribe of unsubscribers) {
         unsubscribe();
       }
@@ -490,13 +673,22 @@ function App() {
         continue;
       }
       const packageJson = await readPackageJson(projectPath);
-      const scripts = Object.entries(packageJson.scripts).map(
-        ([name, command]) => createScript(name, command),
+      const entries = Object.entries(packageJson.scripts);
+      const canonicalScriptOrder = entries.map(([name]) => name);
+      const scriptsOrdered = entries.map(([name, command]) =>
+        createScript(name, command),
+      );
+      const scripts = orderScriptsWithPins(
+        scriptsOrdered,
+        [],
+        canonicalScriptOrder,
       );
       projects.push({
         id: crypto.randomUUID(),
         name: createProjectName(projectPath),
         path: projectPath,
+        canonicalScriptOrder,
+        pinnedScripts: [],
         scripts,
       });
     }
@@ -874,6 +1066,52 @@ function App() {
     }
   }
 
+  function handleTogglePinnedScript(scriptName: string) {
+    const projectId = activeProject?.id;
+    if (projectId === undefined) {
+      return;
+    }
+
+    setState((prev) => ({
+      ...prev,
+      projects: prev.projects.map((project) => {
+        if (project.id !== projectId) {
+          return project;
+        }
+        const isPinned = project.pinnedScripts.includes(scriptName);
+        const pinnedScripts = isPinned
+          ? project.pinnedScripts.filter((name) => name !== scriptName)
+          : [...project.pinnedScripts, scriptName];
+        const scripts = orderScriptsWithPins(
+          project.scripts,
+          pinnedScripts,
+          project.canonicalScriptOrder,
+        );
+        return { ...project, pinnedScripts, scripts };
+      }),
+    }));
+  }
+
+  function handleDismissPortConflict(scriptName: string) {
+    const projectId = activeProject?.id;
+    if (projectId === undefined) {
+      return;
+    }
+
+    setState((prev) => ({
+      ...prev,
+      projects: updateScriptInProjects(
+        prev.projects,
+        projectId,
+        scriptName,
+        (script) => ({
+          ...script,
+          portConflictHint: undefined,
+        }),
+      ),
+    }));
+  }
+
   async function handleStopScript(scriptName: string) {
     if (activeProject === undefined) {
       return;
@@ -899,8 +1137,11 @@ function App() {
             ...currentScript,
             status: "stopped",
             pid: undefined,
+            externalRunning: false,
             cpuPercent: undefined,
             memoryMb: undefined,
+            lastRunSucceeded: undefined,
+            portConflictHint: undefined,
             logs: [...currentScript.logs, "[system] stop requested"],
           }),
         ),
@@ -1015,11 +1256,15 @@ function App() {
           <ProjectView
             appError={appError}
             isLoadingOutdated={isLoadingOutdated}
+            managedScriptPids={managedScriptPids}
+            managedScriptPidSignature={managedScriptPidSignature}
             updateProgress={updateProgress}
             isUpdatingDependencies={isUpdatingDependencies}
             onAddProject={handleAddProject}
+            onDismissPortConflict={handleDismissPortConflict}
             onRefreshOutdated={handleRefreshOutdated}
             onToggleOutdatedPackage={handleToggleOutdatedPackage}
+            onTogglePinnedScript={handleTogglePinnedScript}
             onUpdateDependencies={(includeMajor) => {
               void handleUpdateDependencies(includeMajor);
             }}

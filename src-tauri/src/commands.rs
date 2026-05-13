@@ -4,10 +4,26 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::process::{Child, Command, Stdio};
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
+use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_notification::NotificationExt;
+
+/// Prefer absolute paths: Tauri GUI processes often have a minimal PATH, so `lsof` via `zsh -lc` is brittle.
+fn lsof_executable() -> &'static str {
+    static CACHED: OnceLock<&'static str> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        if Path::new("/usr/sbin/lsof").exists() {
+            "/usr/sbin/lsof"
+        } else if Path::new("/usr/bin/lsof").exists() {
+            "/usr/bin/lsof"
+        } else {
+            "lsof"
+        }
+    })
+}
 
 #[derive(Debug, Deserialize)]
 struct PackageJsonFile {
@@ -192,11 +208,30 @@ fn infer_script_port(script_command: &str) -> Option<u16> {
     None
 }
 
-fn find_pid_for_project_listening_on_port(path: &Path, port: u16) -> Option<u32> {
-    let list_output = Command::new("/bin/zsh")
+fn cwd_for_pid(pid: u32) -> Option<PathBuf> {
+    let cwd_output = Command::new(lsof_executable())
         .args([
-            "-lc",
-            &format!("lsof -nP -iTCP:{} -sTCP:LISTEN -t || true", port),
+            "-a",
+            "-p",
+            &pid.to_string(),
+            "-d",
+            "cwd",
+            "-Fn",
+        ])
+        .output()
+        .ok()?;
+    let cwd_stdout = String::from_utf8_lossy(&cwd_output.stdout);
+    let cwd_line = cwd_stdout.lines().find(|entry| entry.starts_with('n'))?;
+    Some(PathBuf::from(cwd_line.trim_start_matches('n')))
+}
+
+fn find_pid_for_project_listening_on_port(path: &Path, port: u16) -> Option<u32> {
+    let list_output = Command::new(lsof_executable())
+        .args([
+            "-nP",
+            &format!("-iTCP:{}", port),
+            "-sTCP:LISTEN",
+            "-t",
         ])
         .output()
         .ok()?;
@@ -209,17 +244,13 @@ fn find_pid_for_project_listening_on_port(path: &Path, port: u16) -> Option<u32>
             Err(_) => continue,
         };
 
-        let cwd_output = Command::new("/bin/zsh")
-            .args(["-lc", &format!("lsof -a -p {} -d cwd -Fn || true", pid)])
-            .output()
-            .ok()?;
-        let cwd_stdout = String::from_utf8_lossy(&cwd_output.stdout);
-        let Some(cwd_line) = cwd_stdout.lines().find(|entry| entry.starts_with('n')) else {
-            continue;
+        let cwd_path = match cwd_for_pid(pid) {
+            Some(cwd_path) => cwd_path,
+            None => continue,
         };
-        let cwd_path = PathBuf::from(cwd_line.trim_start_matches('n'));
-        let Some(canonical_cwd) = fs::canonicalize(cwd_path).ok() else {
-            continue;
+        let canonical_cwd = match fs::canonicalize(&cwd_path) {
+            Ok(canonical_cwd) => canonical_cwd,
+            Err(_) => continue,
         };
 
         if canonical_cwd == canonical_project {
@@ -228,6 +259,67 @@ fn find_pid_for_project_listening_on_port(path: &Path, port: u16) -> Option<u32>
     }
 
     None
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TcpPortListener {
+    pub pid: u32,
+    pub command: String,
+    pub cwd: Option<String>,
+}
+
+/// Lists processes listening on the given TCP port (best-effort via `lsof`).
+#[tauri::command]
+pub fn inspect_tcp_port_listeners(port: u16) -> Result<Vec<TcpPortListener>, String> {
+    let list_output = Command::new(lsof_executable())
+        .args(["-nP", &format!("-iTCP:{}", port), "-sTCP:LISTEN"])
+        .stderr(Stdio::null())
+        .output()
+        .map_err(|error| format!("lsof invocation failed: {}", error))?;
+
+    let stdout = String::from_utf8_lossy(&list_output.stdout);
+    let mut seen = std::collections::HashSet::<u32>::new();
+    let mut listeners = Vec::new();
+
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("COMMAND") {
+            continue;
+        }
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 2 {
+            continue;
+        }
+        let command = cols[0].to_string();
+        let Ok(pid) = cols[1].parse::<u32>() else {
+            continue;
+        };
+        if !seen.insert(pid) {
+            continue;
+        }
+        listeners.push(TcpPortListener {
+            pid,
+            command,
+            cwd: cwd_for_pid(pid).and_then(|p| fs::canonicalize(&p).ok()).and_then(|p| {
+                p.into_os_string()
+                    .into_string()
+                    .ok()
+            }),
+        });
+    }
+
+    Ok(listeners)
+}
+
+/// Returns a likely dev server port inferred from `package.json` script text (matches adoption heuristics).
+#[tauri::command]
+pub fn infer_script_port_for_script(path: String, script_name: String) -> Result<Option<u16>, String> {
+    let package = read_package_json(path)?;
+    let command = package.scripts.get(&script_name).ok_or_else(|| {
+        format!("Unknown script '{}' in package.json", script_name)
+    })?;
+    Ok(infer_script_port(command))
 }
 
 fn try_adopt_existing_process(path: &str, script: &str, state: &ProcessState) -> Option<u32> {
@@ -994,9 +1086,20 @@ pub fn run_script(
     let path_clone = path.clone();
     let children_map = state.children.clone();
     std::thread::spawn(move || {
-        let status_result = match child_handle.lock() {
-            Ok(mut child) => child.wait(),
-            Err(_) => return,
+        // Never hold `Mutex<Child>` across `wait()`: `stop_process` must be able to
+        // signal the PID without deadlocking against this thread.
+        let status_result = loop {
+            let mut child = match child_handle.lock() {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => {}
+                Err(e) => break Err(e),
+            }
+            drop(child);
+            std::thread::sleep(std::time::Duration::from_millis(50));
         };
 
         if let Ok(status) = status_result {
@@ -1007,16 +1110,31 @@ pub fn run_script(
             let _ = process_state.unregister_running(pid);
 
             let script_for_notification = script_clone.clone();
+            #[cfg(unix)]
+            let exit_signal = status.signal().map(|s| s.to_string());
+            #[cfg(not(unix))]
+            let exit_signal: Option<String> = None;
+
             let payload = ScriptExitEvent {
                 pid,
                 path: path_clone,
                 script: script_clone,
                 code: status.code(),
-                signal: None,
+                signal: exit_signal,
             };
-            let did_fail = match status.code() {
-                Some(code) => code != 0,
-                None => true,
+            let did_fail = {
+                #[cfg(unix)]
+                {
+                    match status.signal() {
+                        Some(2 | 15) => false,
+                        Some(_) => true,
+                        None => !matches!(status.code(), Some(0)),
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    !matches!(status.code(), Some(0))
+                }
             };
             let _ = app_clone.emit("script-exit", payload);
             let _ = crate::refresh_tray_menu(&app_clone);
@@ -1088,53 +1206,111 @@ pub fn adopt_running_scripts(
     Ok(adopted)
 }
 
+/// Adopted / external scripts: no in-app `Child` handle — send an OS-level stop signal.
+#[cfg(unix)]
+fn terminate_pid_without_child_handle(pid: u32) -> Result<(), String> {
+    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "Could not signal process {}: {}",
+            pid,
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn terminate_pid_without_child_handle(pid: u32) -> Result<(), String> {
+    let status = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("Failed to invoke taskkill for pid {}: {}", pid, error))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Could not signal process {} (it may have already exited)",
+            pid
+        ))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn terminate_pid_without_child_handle(pid: u32) -> Result<(), String> {
+    Err(format!(
+        "Stopping pid {} is not supported on this platform",
+        pid
+    ))
+}
+
+fn kill_managed_child(pid: u32, child_arc: &Arc<Mutex<Child>>) -> Result<(), String> {
+    let mut child = child_arc
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    child
+        .kill()
+        .map_err(|error| format!("Failed to stop process {}: {}", pid, error))
+}
+
 #[tauri::command]
 pub fn stop_process(
     app_handle: AppHandle,
     pid: u32,
     state: State<'_, ProcessState>,
 ) -> Result<(), String> {
-    let mut children = state
-        .children
-        .lock()
-        .map_err(|_| String::from("Failed to lock process state"))?;
-    let child = children.remove(&pid);
-    drop(children);
-
-    if let Some(child) = child {
-        let mut child_guard = child
+    // Take the `Child` out of the map so we only track it from this stop attempt and the
+    // reap thread's `Arc` clone. The reap thread never holds `Mutex<Child>` across a
+    // blocking `wait()` (it polls `try_wait`), so we can call `Child::kill()` here without
+    // deadlocking the UI.
+    let detached = {
+        let mut children = state
+            .children
             .lock()
-            .map_err(|_| format!("Failed to lock process {}", pid))?;
-        child_guard
-            .kill()
-            .map_err(|error| format!("Failed to stop process {}: {}", pid, error))?;
-    } else {
-        let status = Command::new("/bin/kill")
-            .args(["-TERM", &pid.to_string()])
-            .status()
-            .map_err(|error| format!("Failed to stop process {}: {}", pid, error))?;
-        if !status.success() {
-            return Err(format!("No running process found for pid {}", pid));
+            .map_err(|_| String::from("Failed to lock process state"))?;
+        children.remove(&pid)
+    };
+
+    let signal_result = match detached.as_ref() {
+        Some(child_arc) => kill_managed_child(pid, child_arc),
+        None => terminate_pid_without_child_handle(pid),
+    };
+
+    if let Err(message) = signal_result {
+        if let Some(child_arc) = detached {
+            state
+                .children
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(pid, child_arc);
         }
+        return Err(message);
     }
+
     let _ = state.unregister_running(pid);
     let _ = crate::refresh_tray_menu(&app_handle);
     notify_script_state(
         &app_handle,
         "Script stop requested",
-        format!("PID {} received termination signal", pid),
+        format!("PID {} — stop requested", pid),
     );
 
     Ok(())
 }
 
-// --- Persisted projects (id, name, path only; scripts re-read on load) ---
+// --- Persisted projects (id, name, path; scripts re-read on load) ---
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct SavedProject {
     pub id: String,
     pub name: String,
     pub path: String,
+    #[serde(default)]
+    pub pinned_scripts: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

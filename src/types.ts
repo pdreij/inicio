@@ -1,5 +1,17 @@
 export type ScriptStatus = "idle" | "running" | "stopped";
 
+export type TcpPortListener = {
+  pid: number;
+  command: string;
+  cwd?: string | null;
+};
+
+export type PortConflictHint = {
+  ports: number[];
+  listeners: TcpPortListener[];
+  inferredPort: number | null;
+};
+
 export type Script = {
   name: string;
   command: string;
@@ -10,6 +22,10 @@ export type Script = {
   externalRunning?: boolean;
   cpuPercent?: number;
   memoryMb?: number;
+  /** True after last process exit was successful (clean); cleared when a new run starts. */
+  lastRunSucceeded?: boolean;
+
+  portConflictHint?: PortConflictHint;
 };
 
 export type Project = {
@@ -17,6 +33,10 @@ export type Project = {
   name: string;
   path: string;
   scripts: Script[];
+  /** Script names in package.json order; used when unpinning so list returns to baseline. */
+  canonicalScriptOrder: string[];
+  /** Script names shown first (in order); persisted with the project. */
+  pinnedScripts: string[];
   /** Set when restoring from disk and package.json could not be read. */
   importError?: string;
 };
