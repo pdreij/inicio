@@ -326,6 +326,7 @@ function App() {
         projectPath: string,
         scriptName: string,
         stderrLine: string,
+        emitterPid: number,
       ) => {
         if (cancelled) {
           return;
@@ -377,26 +378,45 @@ function App() {
           inferredPort,
         };
 
-        setState((currentState) => ({
-          ...currentState,
-          projects: currentState.projects.map((project) => {
+        setState((currentState) => {
+          let applied = false;
+          const projects = currentState.projects.map((project) => {
             if (project.path !== projectPath) {
               return project;
             }
 
             return {
               ...project,
-              scripts: project.scripts.map((script) =>
-                script.name === scriptName
-                  ? {
-                      ...script,
-                      portConflictHint: hint,
-                    }
-                  : script,
-              ),
+              scripts: project.scripts.map((script) => {
+                if (script.name !== scriptName) {
+                  return script;
+                }
+
+                const stillSameRun =
+                  script.status === "running" &&
+                  (script.pid === emitterPid ||
+                    (script.externalRunning === true &&
+                      script.pid === undefined));
+
+                if (!stillSameRun) {
+                  return script;
+                }
+
+                applied = true;
+                return {
+                  ...script,
+                  portConflictHint: hint,
+                };
+              }),
             };
-          }),
-        }));
+          });
+
+          if (!applied) {
+            return currentState;
+          }
+
+          return { ...currentState, projects };
+        });
       };
 
       const unlistenLog = await listen<LogEventPayload>(
@@ -443,6 +463,7 @@ function App() {
               payload.path,
               payload.script,
               payload.line,
+              payload.pid,
             );
           }
         },
