@@ -117,6 +117,17 @@ function buildPersistPayload(
   };
 }
 
+/** Same process identity as port-conflict hydration / `script-log` payload.pid. */
+function scriptMatchesPortHydrateEmitterPid(
+  script: Script,
+  emitterPid: number,
+): boolean {
+  return (
+    script.pid === emitterPid ||
+    (script.externalRunning === true && script.pid === undefined)
+  );
+}
+
 function applyAdoptedScripts(
   projects: Project[],
   adoptedScripts: AdoptedScript[],
@@ -173,6 +184,9 @@ function App() {
   const [isHydrated, setIsHydrated] = useState(!isTauriRuntime());
   const persistSignatureRef = useRef<string>("");
   const hasInitializedOutdatedRef = useRef(false);
+  const latestProjectsRef = useRef<Project[]>(state.projects);
+  latestProjectsRef.current = state.projects;
+  const portHydrateInflightRef = useRef(new Set<string>());
 
   const activeProject = useMemo(() => {
     if (state.activeProjectId === undefined) {
@@ -402,9 +416,7 @@ function App() {
 
                 const stillSameRun =
                   script.status === "running" &&
-                  (script.pid === emitterPid ||
-                    (script.externalRunning === true &&
-                      script.pid === undefined));
+                  scriptMatchesPortHydrateEmitterPid(script, emitterPid);
 
                 if (!stillSameRun) {
                   return script;
@@ -467,12 +479,35 @@ function App() {
             !cancelled &&
             isLikelyPortBindError(payload.stream, payload.line)
           ) {
+            const project = latestProjectsRef.current.find(
+              (p) => p.path === payload.path,
+            );
+            const script = project?.scripts.find(
+              (s) => s.name === payload.script,
+            );
+            if (
+              script === undefined ||
+              script.status !== "running" ||
+              !scriptMatchesPortHydrateEmitterPid(script, payload.pid)
+            ) {
+              return;
+            }
+            if (script.portConflictHint !== undefined) {
+              return;
+            }
+            const dedupeKey = `${payload.path}\0${payload.script}\0${payload.pid}`;
+            if (portHydrateInflightRef.current.has(dedupeKey)) {
+              return;
+            }
+            portHydrateInflightRef.current.add(dedupeKey);
             void hydratePortConflictAfterLogLine(
               payload.path,
               payload.script,
               payload.line,
               payload.pid,
-            );
+            ).finally(() => {
+              portHydrateInflightRef.current.delete(dedupeKey);
+            });
           }
         },
       );
@@ -592,6 +627,7 @@ function App() {
 
     return () => {
       cancelled = true;
+      portHydrateInflightRef.current.clear();
       for (const unsubscribe of unsubscribers) {
         unsubscribe();
       }
