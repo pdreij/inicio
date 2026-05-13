@@ -1842,6 +1842,7 @@ name = "inicio"
 version = "0.1.0"
 dependencies = [
  "dirs 5.0.1",
+ "libc",
  "rfd",
  "serde",
  "serde_json",

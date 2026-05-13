@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 #[cfg(unix)]
 use std::os::unix::process::ExitStatusExt;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -1206,15 +1206,66 @@ pub fn adopt_running_scripts(
     Ok(adopted)
 }
 
+/// Adopted / external scripts: no in-app `Child` handle — send an OS-level stop signal.
+#[cfg(unix)]
+fn terminate_pid_without_child_handle(pid: u32) -> Result<(), String> {
+    let rc = unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "Could not signal process {}: {}",
+            pid,
+            std::io::Error::last_os_error()
+        ))
+    }
+}
+
+#[cfg(windows)]
+fn terminate_pid_without_child_handle(pid: u32) -> Result<(), String> {
+    let status = Command::new("taskkill")
+        .args(["/PID", &pid.to_string(), "/T"])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map_err(|error| format!("Failed to invoke taskkill for pid {}: {}", pid, error))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!(
+            "Could not signal process {} (it may have already exited)",
+            pid
+        ))
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn terminate_pid_without_child_handle(pid: u32) -> Result<(), String> {
+    Err(format!(
+        "Stopping pid {} is not supported on this platform",
+        pid
+    ))
+}
+
+fn kill_managed_child(pid: u32, child_arc: &Arc<Mutex<Child>>) -> Result<(), String> {
+    let mut child = child_arc
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    child
+        .kill()
+        .map_err(|error| format!("Failed to stop process {}: {}", pid, error))
+}
+
 #[tauri::command]
 pub fn stop_process(
     app_handle: AppHandle,
     pid: u32,
     state: State<'_, ProcessState>,
 ) -> Result<(), String> {
-    // Remove the Child from our map without locking `Mutex<Child>`. The reap thread
-    // holds that mutex for the entire `wait()`; taking it here to call `kill()` deadlocks
-    // the UI until the process exits on its own.
+    // Take the `Child` out of the map so we only track it from this stop attempt and the
+    // reap thread's `Arc` clone. The reap thread never holds `Mutex<Child>` across a
+    // blocking `wait()` (it polls `try_wait`), so we can call `Child::kill()` here without
+    // deadlocking the UI.
     let detached = {
         let mut children = state
             .children
@@ -1223,36 +1274,20 @@ pub fn stop_process(
         children.remove(&pid)
     };
 
-    let status = Command::new("/bin/kill")
-        .args(["-TERM", &pid.to_string()])
-        .status()
-        .map_err(|error| {
-            if let Some(child_arc) = detached.as_ref() {
-                state
-                    .children
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .insert(pid, child_arc.clone());
-            }
-            format!("Failed to invoke kill for pid {}: {}", pid, error)
-        })?;
+    let signal_result = match detached.as_ref() {
+        Some(child_arc) => kill_managed_child(pid, child_arc),
+        None => terminate_pid_without_child_handle(pid),
+    };
 
-    if !status.success() {
+    if let Err(message) = signal_result {
         if let Some(child_arc) = detached {
             state
                 .children
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(pid, child_arc);
-            return Err(format!(
-                "Could not signal process {} (it may still be running)",
-                pid
-            ));
         }
-        return Err(format!(
-            "Could not signal process {} (it may have already exited)",
-            pid
-        ));
+        return Err(message);
     }
 
     let _ = state.unregister_running(pid);
@@ -1260,7 +1295,7 @@ pub fn stop_process(
     notify_script_state(
         &app_handle,
         "Script stop requested",
-        format!("PID {} received termination signal", pid),
+        format!("PID {} — stop requested", pid),
     );
 
     Ok(())
