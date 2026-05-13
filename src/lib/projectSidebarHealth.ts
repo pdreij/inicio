@@ -4,14 +4,15 @@ export type SidebarProjectHealth = "running" | "warning" | "stopped";
 
 /** Suffix after `[system] process exited (` — same shape as App `script-exit` logs (`code=…, signal=…`). */
 function lastProcessExitSnippet(logs: string[]): string | undefined {
-  let found: string | undefined;
-  for (const entry of logs) {
-    const idx = entry.indexOf("[system] process exited (");
+  const marker = "[system] process exited (";
+  for (let i = logs.length - 1; i >= 0; i -= 1) {
+    const entry = logs[i];
+    const idx = entry.indexOf(marker);
     if (idx !== -1) {
-      found = entry.slice(idx + "[system] process exited (".length);
+      return entry.slice(idx + marker.length);
     }
   }
-  return found;
+  return undefined;
 }
 
 function stoppedScriptHasFailedExit(logs: string[]): boolean {
