@@ -1215,7 +1215,7 @@ pub fn stop_process(
     // Remove the Child from our map without locking `Mutex<Child>`. The reap thread
     // holds that mutex for the entire `wait()`; taking it here to call `kill()` deadlocks
     // the UI until the process exits on its own.
-    let _detached_child = {
+    let detached = {
         let mut children = state
             .children
             .lock()
@@ -1226,10 +1226,29 @@ pub fn stop_process(
     let status = Command::new("/bin/kill")
         .args(["-TERM", &pid.to_string()])
         .status()
-        .map_err(|error| format!("Failed to stop process {}: {}", pid, error))?;
+        .map_err(|error| {
+            if let Some(child_arc) = detached.as_ref() {
+                state
+                    .children
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(pid, child_arc.clone());
+            }
+            format!("Failed to invoke kill for pid {}: {}", pid, error)
+        })?;
 
-    if !status.success() && _detached_child.is_none() {
-        // External / adopted-only processes: no in-app Child; mirror prior strict behavior.
+    if !status.success() {
+        if let Some(child_arc) = detached {
+            state
+                .children
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(pid, child_arc);
+            return Err(format!(
+                "Could not signal process {} (it may still be running)",
+                pid
+            ));
+        }
         return Err(format!(
             "Could not signal process {} (it may have already exited)",
             pid
