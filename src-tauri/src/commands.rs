@@ -5,9 +5,23 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_notification::NotificationExt;
+
+/// Prefer absolute paths: Tauri GUI processes often have a minimal PATH, so `lsof` via `zsh -lc` is brittle.
+fn lsof_executable() -> &'static str {
+    static CACHED: OnceLock<&'static str> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        if Path::new("/usr/sbin/lsof").exists() {
+            "/usr/sbin/lsof"
+        } else if Path::new("/usr/bin/lsof").exists() {
+            "/usr/bin/lsof"
+        } else {
+            "lsof"
+        }
+    })
+}
 
 #[derive(Debug, Deserialize)]
 struct PackageJsonFile {
@@ -193,8 +207,15 @@ fn infer_script_port(script_command: &str) -> Option<u16> {
 }
 
 fn cwd_for_pid(pid: u32) -> Option<PathBuf> {
-    let cwd_output = Command::new("/bin/zsh")
-        .args(["-lc", &format!("lsof -a -p {} -d cwd -Fn || true", pid)])
+    let cwd_output = Command::new(lsof_executable())
+        .args([
+            "-a",
+            "-p",
+            &pid.to_string(),
+            "-d",
+            "cwd",
+            "-Fn",
+        ])
         .output()
         .ok()?;
     let cwd_stdout = String::from_utf8_lossy(&cwd_output.stdout);
@@ -203,10 +224,12 @@ fn cwd_for_pid(pid: u32) -> Option<PathBuf> {
 }
 
 fn find_pid_for_project_listening_on_port(path: &Path, port: u16) -> Option<u32> {
-    let list_output = Command::new("/bin/zsh")
+    let list_output = Command::new(lsof_executable())
         .args([
-            "-lc",
-            &format!("lsof -nP -iTCP:{} -sTCP:LISTEN -t || true", port),
+            "-nP",
+            &format!("-iTCP:{}", port),
+            "-sTCP:LISTEN",
+            "-t",
         ])
         .output()
         .ok()?;
@@ -247,14 +270,9 @@ pub struct TcpPortListener {
 /// Lists processes listening on the given TCP port (best-effort via `lsof`).
 #[tauri::command]
 pub fn inspect_tcp_port_listeners(port: u16) -> Result<Vec<TcpPortListener>, String> {
-    let list_output = Command::new("/bin/zsh")
-        .args([
-            "-lc",
-            &format!(
-                "lsof -nP -iTCP:{} -sTCP:LISTEN 2>/dev/null || true",
-                port
-            ),
-        ])
+    let list_output = Command::new(lsof_executable())
+        .args(["-nP", &format!("-iTCP:{}", port), "-sTCP:LISTEN"])
+        .stderr(Stdio::null())
         .output()
         .map_err(|error| format!("lsof invocation failed: {}", error))?;
 
