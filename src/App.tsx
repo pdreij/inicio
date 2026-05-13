@@ -23,6 +23,7 @@ import {
   isLikelyPortBindError,
   parsePortsFromStderrLine,
 } from "./lib/parsePortConflict";
+import { classifyProcessExit } from "./lib/exitClassification";
 import type {
   AdoptedScript,
   ProcessResourceSnapshot,
@@ -73,11 +74,6 @@ function isAlreadyRunningMessage(stream: string, line: string): boolean {
     normalized.includes("address already in use") ||
     normalized.includes("port is already in use")
   );
-}
-
-/** True only for a definitive clean exit — used after `script-exit` so build scripts do not share the error styling. */
-function processExitedCleanly(payload: ProcessExitPayload): boolean {
-  return payload.signal === null && payload.code !== null && payload.code === 0;
 }
 
 function updateScriptInProjects(
@@ -152,6 +148,7 @@ function applyAdoptedScripts(
         pid: adopted.pid,
         externalRunning: true,
         lastRunSucceeded: undefined,
+        portConflictHint: undefined,
         logs: [
           ...script.logs,
           `[system] adopted already running process (pid ${adopted.pid})`,
@@ -595,12 +592,14 @@ function App() {
                   };
                 }
 
-                const failedExit = !processExitedCleanly(payload);
+                const exitClass = classifyProcessExit(payload);
+                const failedExit = exitClass === "failure";
+                const cleanSuccess = exitClass === "success";
 
                 return {
                   ...script,
                   status: failedExit ? "stopped" : "idle",
-                  lastRunSucceeded: failedExit ? undefined : true,
+                  lastRunSucceeded: cleanSuccess ? true : undefined,
                   pid: undefined,
                   externalRunning: false,
                   cpuPercent: undefined,

@@ -1,4 +1,5 @@
 import type { Project } from "../types";
+import { isExpectedStopSignal } from "./exitClassification";
 
 export type SidebarProjectHealth = "running" | "warning" | "stopped";
 
@@ -24,7 +25,7 @@ function stoppedScriptHasFailedExit(logs: string[]): boolean {
   const signalMatch = tail.match(/signal=([^,)]+)/);
   if (signalMatch !== null) {
     const sig = signalMatch[1]?.trim().toLowerCase() ?? "";
-    if (sig.length > 0 && sig !== "none") {
+    if (sig.length > 0 && sig !== "none" && !isExpectedStopSignal(sig)) {
       return true;
     }
   }

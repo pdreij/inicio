@@ -5,6 +5,8 @@ use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 use std::sync::{Arc, Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_notification::NotificationExt;
@@ -1108,16 +1110,31 @@ pub fn run_script(
             let _ = process_state.unregister_running(pid);
 
             let script_for_notification = script_clone.clone();
+            #[cfg(unix)]
+            let exit_signal = status.signal().map(|s| s.to_string());
+            #[cfg(not(unix))]
+            let exit_signal: Option<String> = None;
+
             let payload = ScriptExitEvent {
                 pid,
                 path: path_clone,
                 script: script_clone,
                 code: status.code(),
-                signal: None,
+                signal: exit_signal,
             };
-            let did_fail = match status.code() {
-                Some(code) => code != 0,
-                None => true,
+            let did_fail = {
+                #[cfg(unix)]
+                {
+                    match status.signal() {
+                        Some(2 | 15) => false,
+                        Some(_) => true,
+                        None => !matches!(status.code(), Some(0)),
+                    }
+                }
+                #[cfg(not(unix))]
+                {
+                    !matches!(status.code(), Some(0))
+                }
             };
             let _ = app_clone.emit("script-exit", payload);
             let _ = crate::refresh_tray_menu(&app_clone);
