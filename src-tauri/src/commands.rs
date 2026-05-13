@@ -192,6 +192,16 @@ fn infer_script_port(script_command: &str) -> Option<u16> {
     None
 }
 
+fn cwd_for_pid(pid: u32) -> Option<PathBuf> {
+    let cwd_output = Command::new("/bin/zsh")
+        .args(["-lc", &format!("lsof -a -p {} -d cwd -Fn || true", pid)])
+        .output()
+        .ok()?;
+    let cwd_stdout = String::from_utf8_lossy(&cwd_output.stdout);
+    let cwd_line = cwd_stdout.lines().find(|entry| entry.starts_with('n'))?;
+    Some(PathBuf::from(cwd_line.trim_start_matches('n')))
+}
+
 fn find_pid_for_project_listening_on_port(path: &Path, port: u16) -> Option<u32> {
     let list_output = Command::new("/bin/zsh")
         .args([
@@ -209,18 +219,8 @@ fn find_pid_for_project_listening_on_port(path: &Path, port: u16) -> Option<u32>
             Err(_) => continue,
         };
 
-        let cwd_output = Command::new("/bin/zsh")
-            .args(["-lc", &format!("lsof -a -p {} -d cwd -Fn || true", pid)])
-            .output()
-            .ok()?;
-        let cwd_stdout = String::from_utf8_lossy(&cwd_output.stdout);
-        let Some(cwd_line) = cwd_stdout.lines().find(|entry| entry.starts_with('n')) else {
-            continue;
-        };
-        let cwd_path = PathBuf::from(cwd_line.trim_start_matches('n'));
-        let Some(canonical_cwd) = fs::canonicalize(cwd_path).ok() else {
-            continue;
-        };
+        let cwd_path = cwd_for_pid(pid)?;
+        let canonical_cwd = fs::canonicalize(cwd_path).ok()?;
 
         if canonical_cwd == canonical_project {
             return Some(pid);
@@ -228,6 +228,72 @@ fn find_pid_for_project_listening_on_port(path: &Path, port: u16) -> Option<u32>
     }
 
     None
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TcpPortListener {
+    pub pid: u32,
+    pub command: String,
+    pub cwd: Option<String>,
+}
+
+/// Lists processes listening on the given TCP port (best-effort via `lsof`).
+#[tauri::command]
+pub fn inspect_tcp_port_listeners(port: u16) -> Result<Vec<TcpPortListener>, String> {
+    let list_output = Command::new("/bin/zsh")
+        .args([
+            "-lc",
+            &format!(
+                "lsof -nP -iTCP:{} -sTCP:LISTEN 2>/dev/null || true",
+                port
+            ),
+        ])
+        .output()
+        .map_err(|error| format!("lsof invocation failed: {}", error))?;
+
+    let stdout = String::from_utf8_lossy(&list_output.stdout);
+    let mut seen = std::collections::HashSet::<u32>::new();
+    let mut listeners = Vec::new();
+
+    for line in stdout.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with("COMMAND") {
+            continue;
+        }
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() < 2 {
+            continue;
+        }
+        let command = cols[0].to_string();
+        let Ok(pid) = cols[1].parse::<u32>() else {
+            continue;
+        };
+        if !seen.insert(pid) {
+            continue;
+        }
+        listeners.push(TcpPortListener {
+            pid,
+            command,
+            cwd: cwd_for_pid(pid).and_then(|p| fs::canonicalize(&p).ok()).and_then(|p| {
+                p.into_os_string()
+                    .into_string()
+                    .ok()
+            }),
+        });
+    }
+
+    Ok(listeners)
+}
+
+/// Returns a likely dev server port inferred from `package.json` script text (matches adoption heuristics).
+#[tauri::command]
+pub fn infer_script_port_for_script(path: String, script_name: String) -> Result<Option<u16>, String> {
+    let package = read_package_json(path)?;
+    let command = package.scripts.get(&script_name).ok_or_else(|| {
+        format!("Unknown script '{}' in package.json", script_name)
+    })?;
+    Ok(infer_script_port(command))
 }
 
 fn try_adopt_existing_process(path: &str, script: &str, state: &ProcessState) -> Option<u32> {
@@ -1128,13 +1194,16 @@ pub fn stop_process(
     Ok(())
 }
 
-// --- Persisted projects (id, name, path only; scripts re-read on load) ---
+// --- Persisted projects (id, name, path; scripts re-read on load) ---
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "camelCase")]
 pub struct SavedProject {
     pub id: String,
     pub name: String,
     pub path: String,
+    #[serde(default)]
+    pub pinned_scripts: Vec<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]

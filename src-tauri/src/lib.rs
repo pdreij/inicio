@@ -50,7 +50,22 @@ pub(crate) fn refresh_tray_menu(app_handle: &AppHandle) -> Result<(), String> {
         };
 
         let mut script_names: Vec<String> = scripts_response.scripts.keys().cloned().collect();
-        script_names.sort();
+        let pin_index: std::collections::HashMap<&str, usize> = project
+            .pinned_scripts
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name.as_str(), index))
+            .collect();
+        script_names.sort_by(|a, b| {
+            let a_pinned = pin_index.get(a.as_str());
+            let b_pinned = pin_index.get(b.as_str());
+            match (a_pinned, b_pinned) {
+                (Some(ia), Some(ib)) => ia.cmp(ib),
+                (Some(_), None) => std::cmp::Ordering::Less,
+                (None, Some(_)) => std::cmp::Ordering::Greater,
+                (None, None) => a.cmp(b),
+            }
+        });
         let mut project_submenu = SubmenuBuilder::new(app_handle, project.name.clone());
 
         for script_name in script_names {
@@ -177,7 +192,9 @@ pub fn run() {
             commands::check_outdated_packages,
             commands::update_dependencies,
             commands::adopt_running_scripts,
-            commands::get_process_resources
+            commands::get_process_resources,
+            commands::inspect_tcp_port_listeners,
+            commands::infer_script_port_for_script
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");
