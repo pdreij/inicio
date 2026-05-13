@@ -1084,9 +1084,20 @@ pub fn run_script(
     let path_clone = path.clone();
     let children_map = state.children.clone();
     std::thread::spawn(move || {
-        let status_result = match child_handle.lock() {
-            Ok(mut child) => child.wait(),
-            Err(_) => return,
+        // Never hold `Mutex<Child>` across `wait()`: `stop_process` must be able to
+        // signal the PID without deadlocking against this thread.
+        let status_result = loop {
+            let mut child = match child_handle.lock() {
+                Ok(c) => c,
+                Err(_) => return,
+            };
+            match child.try_wait() {
+                Ok(Some(status)) => break Ok(status),
+                Ok(None) => {}
+                Err(e) => break Err(e),
+            }
+            drop(child);
+            std::thread::sleep(std::time::Duration::from_millis(50));
         };
 
         if let Ok(status) = status_result {
@@ -1184,29 +1195,30 @@ pub fn stop_process(
     pid: u32,
     state: State<'_, ProcessState>,
 ) -> Result<(), String> {
-    let mut children = state
-        .children
-        .lock()
-        .map_err(|_| String::from("Failed to lock process state"))?;
-    let child = children.remove(&pid);
-    drop(children);
-
-    if let Some(child) = child {
-        let mut child_guard = child
+    // Remove the Child from our map without locking `Mutex<Child>`. The reap thread
+    // holds that mutex for the entire `wait()`; taking it here to call `kill()` deadlocks
+    // the UI until the process exits on its own.
+    let _detached_child = {
+        let mut children = state
+            .children
             .lock()
-            .map_err(|_| format!("Failed to lock process {}", pid))?;
-        child_guard
-            .kill()
-            .map_err(|error| format!("Failed to stop process {}: {}", pid, error))?;
-    } else {
-        let status = Command::new("/bin/kill")
-            .args(["-TERM", &pid.to_string()])
-            .status()
-            .map_err(|error| format!("Failed to stop process {}: {}", pid, error))?;
-        if !status.success() {
-            return Err(format!("No running process found for pid {}", pid));
-        }
+            .map_err(|_| String::from("Failed to lock process state"))?;
+        children.remove(&pid)
+    };
+
+    let status = Command::new("/bin/kill")
+        .args(["-TERM", &pid.to_string()])
+        .status()
+        .map_err(|error| format!("Failed to stop process {}: {}", pid, error))?;
+
+    if !status.success() && _detached_child.is_none() {
+        // External / adopted-only processes: no in-app Child; mirror prior strict behavior.
+        return Err(format!(
+            "Could not signal process {} (it may have already exited)",
+            pid
+        ));
     }
+
     let _ = state.unregister_running(pid);
     let _ = crate::refresh_tray_menu(&app_handle);
     notify_script_state(
