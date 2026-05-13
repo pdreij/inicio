@@ -237,14 +237,21 @@ function App() {
           const pinnedScripts = saved.pinnedScripts ?? [];
           try {
             const packageJson = await readPackageJson(saved.path);
-            const scriptsOrdered = Object.entries(packageJson.scripts).map(
-              ([name, command]) => createScript(name, command),
+            const entries = Object.entries(packageJson.scripts);
+            const canonicalScriptOrder = entries.map(([name]) => name);
+            const scriptsOrdered = entries.map(([name, command]) =>
+              createScript(name, command),
             );
-            const scripts = orderScriptsWithPins(scriptsOrdered, pinnedScripts);
+            const scripts = orderScriptsWithPins(
+              scriptsOrdered,
+              pinnedScripts,
+              canonicalScriptOrder,
+            );
             rebuilt.push({
               id: saved.id,
               name: saved.name,
               path: saved.path,
+              canonicalScriptOrder,
               pinnedScripts,
               scripts,
             });
@@ -253,6 +260,7 @@ function App() {
               id: saved.id,
               name: saved.name,
               path: saved.path,
+              canonicalScriptOrder: [],
               pinnedScripts,
               scripts: [],
               importError:
@@ -630,13 +638,21 @@ function App() {
         continue;
       }
       const packageJson = await readPackageJson(projectPath);
-      const scripts = Object.entries(packageJson.scripts).map(
-        ([name, command]) => createScript(name, command),
+      const entries = Object.entries(packageJson.scripts);
+      const canonicalScriptOrder = entries.map(([name]) => name);
+      const scriptsOrdered = entries.map(([name, command]) =>
+        createScript(name, command),
+      );
+      const scripts = orderScriptsWithPins(
+        scriptsOrdered,
+        [],
+        canonicalScriptOrder,
       );
       projects.push({
         id: crypto.randomUUID(),
         name: createProjectName(projectPath),
         path: projectPath,
+        canonicalScriptOrder,
         pinnedScripts: [],
         scripts,
       });
@@ -1031,7 +1047,11 @@ function App() {
         const pinnedScripts = isPinned
           ? project.pinnedScripts.filter((name) => name !== scriptName)
           : [...project.pinnedScripts, scriptName];
-        const scripts = orderScriptsWithPins(project.scripts, pinnedScripts);
+        const scripts = orderScriptsWithPins(
+          project.scripts,
+          pinnedScripts,
+          project.canonicalScriptOrder,
+        );
         return { ...project, pinnedScripts, scripts };
       }),
     }));

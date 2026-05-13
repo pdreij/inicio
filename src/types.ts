@@ -33,6 +33,8 @@ export type Project = {
   name: string;
   path: string;
   scripts: Script[];
+  /** Script names in package.json order; used when unpinning so list returns to baseline. */
+  canonicalScriptOrder: string[];
   /** Script names shown first (in order); persisted with the project. */
   pinnedScripts: string[];
   /** Set when restoring from disk and package.json could not be read. */
