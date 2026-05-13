@@ -2,7 +2,7 @@ import type { Project } from "../types";
 
 export type SidebarProjectHealth = "running" | "warning" | "stopped";
 
-/** Last `[system] process exited (` line suffix, e.g. `code=1, signal=none)`. */
+/** Suffix after `[system] process exited (` — same shape as App `script-exit` logs (`code=…, signal=…`). */
 function lastProcessExitSnippet(logs: string[]): string | undefined {
   let found: string | undefined;
   for (const entry of logs) {
@@ -19,6 +19,15 @@ function stoppedScriptHasFailedExit(logs: string[]): boolean {
   if (tail === undefined) {
     return false;
   }
+
+  const signalMatch = tail.match(/signal=([^,)]+)/);
+  if (signalMatch !== null) {
+    const sig = signalMatch[1]?.trim().toLowerCase() ?? "";
+    if (sig.length > 0 && sig !== "none") {
+      return true;
+    }
+  }
+
   const codeMatch = tail.match(/code=([^,)]+)/);
   if (codeMatch === null) {
     return false;
