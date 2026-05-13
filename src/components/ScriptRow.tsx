@@ -5,6 +5,8 @@ import type { Script } from "../types";
 type ScriptRowProps = {
   script: Script;
   isPinned: boolean;
+  /** Precomputed sorted PIDs (`a,b,c`). Must match `managedScriptPids` contents. */
+  managedScriptPidSignature: string;
   managedScriptPids: ReadonlySet<number>;
   onRun: () => void;
   onStop: () => void;
@@ -56,6 +58,7 @@ function statusLabel(script: Script): string {
 function ScriptRowComponent({
   script,
   isPinned,
+  managedScriptPidSignature: _memoManagedPidSig,
   managedScriptPids,
   onRun,
   onStop,
@@ -252,8 +255,7 @@ export const ScriptRow = memo(
     prev.script.logs.length === next.script.logs.length &&
     prev.script.lastRunSucceeded === next.script.lastRunSucceeded &&
     prev.isPinned === next.isPinned &&
-    [...prev.managedScriptPids].sort((a, b) => a - b).join(",") ===
-      [...next.managedScriptPids].sort((a, b) => a - b).join(",") &&
+    prev.managedScriptPidSignature === next.managedScriptPidSignature &&
     portConflictFingerprint(prev.script) ===
       portConflictFingerprint(next.script),
 );

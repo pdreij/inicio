@@ -199,13 +199,19 @@ function App() {
     [runningPids],
   );
 
-  const managedScriptPids = useMemo(() => {
+  const { managedScriptPids, managedScriptPidSignature } = useMemo(() => {
     const ids = state.projects.flatMap((project) =>
       project.scripts
         .map((script) => script.pid)
         .filter((pid): pid is number => pid !== undefined),
     );
-    return new Set(ids);
+    return {
+      managedScriptPids: new Set(ids),
+      managedScriptPidSignature: ids
+        .slice()
+        .sort((a, b) => a - b)
+        .join(","),
+    };
   }, [state.projects]);
 
   useEffect(() => {
@@ -1173,6 +1179,7 @@ function App() {
             appError={appError}
             isLoadingOutdated={isLoadingOutdated}
             managedScriptPids={managedScriptPids}
+            managedScriptPidSignature={managedScriptPidSignature}
             updateProgress={updateProgress}
             isUpdatingDependencies={isUpdatingDependencies}
             onAddProject={handleAddProject}

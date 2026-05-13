@@ -10,6 +10,7 @@ type ProjectViewProps = {
   updateProgress: number;
   selectedOutdatedPackages: string[];
   managedScriptPids: ReadonlySet<number>;
+  managedScriptPidSignature: string;
   onRefreshOutdated: () => void;
   onToggleOutdatedPackage: (packageName: string) => void;
   onUpdateDependencies: (includeMajor: boolean) => void;
@@ -31,6 +32,7 @@ export function ProjectView({
   updateProgress,
   selectedOutdatedPackages,
   managedScriptPids,
+  managedScriptPidSignature,
   onRefreshOutdated,
   onToggleOutdatedPackage,
   onUpdateDependencies,
@@ -170,6 +172,7 @@ export function ProjectView({
           {project.scripts.map((script) => (
             <ScriptRow
               key={script.name}
+              managedScriptPidSignature={managedScriptPidSignature}
               managedScriptPids={managedScriptPids}
               isPinned={project.pinnedScripts.includes(script.name)}
               onDismissPortConflict={() => onDismissPortConflict(script.name)}
