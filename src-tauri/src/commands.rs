@@ -219,8 +219,14 @@ fn find_pid_for_project_listening_on_port(path: &Path, port: u16) -> Option<u32>
             Err(_) => continue,
         };
 
-        let cwd_path = cwd_for_pid(pid)?;
-        let canonical_cwd = fs::canonicalize(cwd_path).ok()?;
+        let cwd_path = match cwd_for_pid(pid) {
+            Some(cwd_path) => cwd_path,
+            None => continue,
+        };
+        let canonical_cwd = match fs::canonicalize(&cwd_path) {
+            Ok(canonical_cwd) => canonical_cwd,
+            Err(_) => continue,
+        };
 
         if canonical_cwd == canonical_project {
             return Some(pid);
